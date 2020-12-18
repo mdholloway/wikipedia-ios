@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="17511" systemVersion="20B29" minimumToolsVersion="Automatic" sourceLanguage="Swift" userDefinedModelVersionIdentifier="">
+    <entity name="WMFEventPlatformEvent" representedClassName="WMFEventPlatformEvent" syncable="YES" codeGenerationType="class">
+        <attribute name="event" optional="YES" attributeType="Transformable"/>
+        <attribute name="failed" optional="YES" attributeType="Boolean" usesScalarValueType="YES"/>
+        <attribute name="postAttempts" optional="YES" attributeType="Integer 16" defaultValueString="0" usesScalarValueType="YES"/>
+        <attribute name="posted" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="recorded" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <fetchIndex name="byRecordedIndex">
+            <fetchIndexElement property="recorded" type="Binary" order="ascending"/>
+        </fetchIndex>
+    </entity>
+    <elements>
+        <element name="WMFEventPlatformEvent" positionX="-63" positionY="-18" width="128" height="104"/>
+    </elements>
+</model>

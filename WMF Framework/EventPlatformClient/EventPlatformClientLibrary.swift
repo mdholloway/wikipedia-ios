@@ -58,7 +58,7 @@ public class EPC: NSObject {
 
     @objc(sharedInstance) public static let shared: EPC? = {
         guard let legacyEventLoggingService = EventLoggingService.shared else {
-            DDLogError("EPCStorageManager: Unable to get pull legacy EventLoggingService instance for instantiating EPCStorageManager")
+            DDLogError("Unable to obtain legacy EventLoggingService instance for instantiating Event Platform Client")
             return nil
         }
 
@@ -68,6 +68,10 @@ public class EPC: NSObject {
     // SINGLETONTODO
     /// Session for requesting data
     let session = MWKDataStore.shared().session
+    
+    let encoder = JSONEncoder()
+    
+    var storageController: StorageController
     
     /**
      * Streams are the event stream identifiers that can be utilized with the EventPlatformClientLibrary. They should
@@ -191,29 +195,6 @@ public class EPC: NSObject {
     private let legacyEventLoggingService: EventLoggingService
 
     /**
-     * Store events until the library is finished initializing
-     *
-     * The EPC library makes an HTTP request to a remote stream configuration
-     * service for information about how to evaluate incoming event data. Until
-     * this initialization is complete, we store any incoming events in this
-     * buffer.
-     *
-     * Only modify (append events to, remove events from) *synchronously* via
-     * `queue.sync`
-     */
-    private var inputBuffer: [EventRequest] = []
-
-    /**
-     * Maximum number of events allowed in the input buffer
-     */
-    private let inbutBufferLimit = 128
-
-    /**
-     * Holds events that have been scheduled for POSTing
-     */
-    private var outputBuffer: [EventRequest] = []
-
-    /**
      * Cache of "in sample" / "out of sample" determination for each stream
      *
      * The process of determining only has to happen the first time an event is
@@ -260,6 +241,14 @@ public class EPC: NSObject {
                 DDLogError("EPC: Unable to instantiate URIs for stream intake and stream config services")
                 return nil
         }
+        
+        guard let storageController = StorageController() else {
+            return nil
+        }
+        self.storageController = storageController
+        
+        self.encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
 
         self.streamIntakeServiceURI = streamIntakeServiceURI
         self.streamConfigServiceURI = streamConfigServiceURI
@@ -410,17 +399,6 @@ public class EPC: NSObject {
                 }
                 result?[stream] = kv.value
             })
-
-            // Process event buffer after making stream configs available
-            // NOTE: If any event is re-submitted while streamConfigurations
-            // is still being set (asynchronously), they will just go back to
-            // input buffer.
-            while let event = inputBufferPopFirst() {
-                guard inSample(stream: event.stream) else {
-                    continue
-                }
-                appendPostToOutputBuffer(event)
-            }
         } catch let error {
             DDLogError("EPC: Problem processing JSON payload from response: \(error)")
         }
@@ -432,22 +410,37 @@ public class EPC: NSObject {
      */
     private func postAllScheduled(_ completion: (() -> Void)? = nil) {
         DDLogDebug("EPC: Posting all scheduled requests")
+        let events = self.storageController.popAll()
+        if events.count == 0 {
+            DDLogDebug("Nothing to send.")
+            return
+        }
+        
         let group = DispatchGroup()
-        while let item = outputBufferPopFirst() {
+        for event in events {
             group.enter()
-            httpPost(url: item.url, body: item.data) { result in
+            
+            #if DEBUG
+            encoder.outputFormatting = .prettyPrinted
+            #endif
+
+            let jsonData = try encoder.encode(event)
+
+            #if DEBUG
+            let jsonString = String(data: jsonData, encoding: .utf8)!
+            DDLogDebug("EPC: Scheduling event to be sent to \(streamIntakeServiceURI) with POST body:\n\(jsonString)")
+            #endif
+            
+            httpPost(url: self.streamIntakeServiceURI, body: jsonData) { result in
                 switch result {
                 case .success:
                     break
                 case .failure(let error):
                     switch error {
                     case .networkingLibraryError:
-                        guard item.attempt < 10 else {
-                            break
-                        }
                         let nextRequest = EventRequest(url: item.url, data: item.data, stream: item.stream, attempt: item.attempt + 1)
                         /// Retry on networking library failure
-                        self.appendPostToOutputBuffer(nextRequest)
+                        self.storageController.push(event)
                     default:
                         /// Give up on events rejected by the server
                         assert(false, "The analytics service failed to process an event. A response code of 400 could indicate that the event didn't conform to provided schema. Check the error for more information.: \(error)")
@@ -551,27 +544,37 @@ public class EPC: NSObject {
         return result
     }
     
-    /// EventBody is used to encod event data into the POST body of a request to the Modern Event Platform
-    struct EventBody<E>: Encodable where E: EventInterface {
+    /// EventBody is used to encode event data into the POST body of a request to the Modern Event Platform
+    public struct Event: Encodable {
+        /**
+         * Defines which schema this event conforms to.
+         * Check the documentation for `EPC.Schema` for more information.
+         */
+        var schema: EPC.Schema
+        
         /// EventGate needs to know which version of the schema to validate against
-        let meta: Meta
+        var meta: Meta
+        
         struct Meta: Codable {
             let stream: Stream
+            
             /**
              * meta.id is *optional* and should only be done in case the client is
              * known to send duplicates of events, otherwise we don't need to
              * make the payload any heavier than it already is
              */
             let id: UUID
-            let domain: String?
         }
+        
         let appInstallID: String
+        
         /**
          * Generated events have the session ID attached to them before stream
          * config is available (in case they're generated offline) and before
          * they're cc'd to any other streams (once config is available).
          */
         let appSessionID: String
+        
         /**
          * The top-level field `client_dt` is for recording the time the event
          * was generated. EventGate sets `meta.dt` during ingestion, so for
@@ -580,14 +583,6 @@ public class EPC: NSObject {
          * for more information.
          */
         let clientDT: Date
-        
-        /**
-         * Event represents the client-provided event data.
-         * The event is encoded at the top level of the resulting structure.
-         * If any of the `CodingKeys` conflict with keys defined by `EventBody`,
-         * the values from `event` will be used.
-         */
-        let event: E
         
         enum CodingKeys: String, CodingKey {
             case schema = "$schema"
@@ -598,27 +593,18 @@ public class EPC: NSObject {
             case event
         }
         
-        func encode(to encoder: Encoder) throws {
+        public func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             do {
                 try container.encode(meta, forKey: .meta)
                 try container.encode(appInstallID, forKey: .appInstallID)
                 try container.encode(appSessionID, forKey: .appSessionID)
                 try container.encode(clientDT, forKey: .clientDT)
-                try container.encode(E.schema, forKey: .schema)
-                try event.encode(to: encoder)
+                try container.encode(schema, forKey: .schema)
             } catch let error {
                 DDLogError("EPC: Error encoding event body: \(error)")
             }
         }
-    }
-    
-    /// EventRequest stores the necessary information for persisting Event requests
-    struct EventRequest: Codable {
-        let url: URL
-        let data: Data
-        let stream: Stream
-        var attempt: Int = 1
     }
     
     /**
@@ -626,11 +612,10 @@ public class EPC: NSObject {
      * - Parameters:
      *      - stream: The stream to submit the event to
      *      - event: The event data
-     *      - domain: Optional domain to include for the event (without protocol)
      *
      * An example call:
      * ```
-     * struct TestEvent: EventInterface {
+     * struct TestEvent: Event {
      *   static let schema = "/analytics/mobile_apps/test/1.0.0"
      *   let test_string: String
      *   let test_map: SourceInfo
@@ -641,50 +626,15 @@ public class EPC: NSObject {
      * }
      *
      * let sourceInfo = TestEvent.SourceInfo(file: "Features/Feed/ExploreViewController.swift", method: "refreshControlActivated")
-     * let event = TestEvent(test_string: "Explore Feeed refreshed", test_map: sourceInfo)
+     * let event = TestEvent(test_string: "Explore Feed refreshed", test_map: sourceInfo)
      *
      * EPC.shared?.submit(
      *   stream: .test, // Defined in `EPC.Stream`
      *   event: event
      * )
      * ```
-     *
-     * Regarding `domain`: this is *optional* and should be used when event needs
-     * to be attrributed to a particular wiki (Wikidata, Wikimedia Commons, a
-     * specific edition of Wikipedia, etc.). If the language is NOT relevant in
-     * the context, `domain` can be safely omitted. Using "domain" rather than
-     * "language" is consistent with the other platforms and allows for the
-     * possibility of setting a non-Wikipedia domain like "commons.wikimedia.org"
-     * and "wikidata.org" for multimedia/metadata-related in-app analytics.
-     * Instrumentation code should use the `host` property of a `URL` as the value
-     * for this parameter.
-     *
-     * Cases where instrumentation would set a `domain`:
-     * - reading or editing an article
-     * - managing watchlist
-     * - interacting with feed
-     * - searching
-     *
-     * Cases where it might not be necessary for the instrument to set a `domain`:
-     * - changing settings
-     * - managing reading lists
-     * - navigating map of nearby articles
-     * - multi-lingual features like Suggested Edits
-     * - marking session start/end; in which case schema and `data` should have a
-     *   `languages` field where user's list of languages can be stored, although
-     *   it might make sense to set it to the domain associated with the user's
-     *   1st preferred language – in which case use
-     *   `MWKLanguageLinkController.sharedInstance().appLanguage.siteURL().host`
      */
-    public func submit<E: EventInterface>(stream: Stream, event: E, domain: String? = nil) {
-        let date = Date() // Record the date synchronously so there's no delay
-        encodeQueue.async {
-            self._submit(stream: stream, event: event, date: date, domain: domain)
-        }
-    }
-
-    /// Private, synchronous version of `submit`.
-    private func _submit<E: EventInterface>(stream: Stream, event: E, date: Date, domain: String? = nil){
+    public func submit(stream: Stream, event: Event) {
         guard sharingUsageData else {
             return
         }
@@ -692,30 +642,14 @@ public class EPC: NSObject {
             DDLogDebug("EPC: Could not retrieve app install ID")
             return
         }
-        let meta = EventBody<E>.Meta(stream: stream, id: UUID(), domain: domain)
 
-        let eventPayload = EventBody(meta: meta, appInstallID: appInstallID, appSessionID: sessionID, clientDT: date, event: event)
+        event.meta = Event.Meta(stream: stream, id: UUID())
+        
         do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            
-            #if DEBUG
-            encoder.outputFormatting = .prettyPrinted
-            #endif
-            
-            let jsonData = try encoder.encode(eventPayload)
-            
-            #if DEBUG
-            let jsonString = String(data: jsonData, encoding: .utf8)!
-            DDLogDebug("EPC: Scheduling event to be sent to \(streamIntakeServiceURI) with POST body:\n\(jsonString)")
-            #endif
-            
-            let request = EventRequest(url: streamIntakeServiceURI, data: jsonData, stream: stream)
             guard let streamConfigs = streamConfigurations else {
-                appendEventToInputBuffer(request)
                 return
             }
-            
+
             guard streamConfigs.keys.contains(stream) else {
                 DDLogDebug("EPC: Event submitted to '\(stream)' but only the following streams are configured: \(streamConfigs.keys.map(\.rawValue).joined(separator: ", "))")
                 return
@@ -724,59 +658,18 @@ public class EPC: NSObject {
             guard inSample(stream: stream) else {
                 return
             }
-            appendPostToOutputBuffer(request)
+
+            self.storageController.push(stream: stream, event: event)
         } catch let error {
             DDLogError("EPC: \(error.localizedDescription)")
         }
+
     }
 }
 
 //MARK: Thread-safe accessors for collection properties
 
 private extension EPC {
-
-    /**
-     * Thread-safe synchronous retrieval of buffered events
-     */
-    func getInputBuffer() -> [EventRequest] {
-        queue.sync {
-            return self.inputBuffer
-        }
-    }
-
-    /**
-     * Thread-safe synchronous buffering of an event
-     * - Parameter event: event to be buffered
-     */
-    func appendEventToInputBuffer(_ event: EventRequest) {
-        queue.sync {
-            /*
-             * Check if input buffer has reached maximum allowed size. Practically
-             * speaking, there should not have been over a hundred events
-             * generated when the user first launches the app and before the
-             * stream configuration has been downloaded and becomes available. In
-             * such a case we're just going to start clearing out the oldest
-             * events to make room for new ones.
-             */
-            if self.inputBuffer.count == self.inbutBufferLimit {
-                _ = self.inputBuffer.remove(at: 0)
-            }
-            self.inputBuffer.append(event)
-        }
-    }
-
-    /**
-     * Thread-safe synchronous removal of first buffered event
-     * - Returns: a previously buffered event
-     */
-    func inputBufferPopFirst() -> EventRequest? {
-        queue.sync {
-            if self.inputBuffer.isEmpty {
-                return nil
-            }
-            return self.inputBuffer.remove(at: 0)
-        }
-    }
 
     /**
      * Thread-safe asynchronous caching of a stream's in-vs-out-of-sample
@@ -810,29 +703,6 @@ private extension EPC {
             self.samplingCache.removeAll()
         }
     }
-
-    /**
-     * Thread-safe asynchronous buffering of an event scheduled for POSTing
-     * - Parameter post: an EventRequest
-     */
-    func appendPostToOutputBuffer(_ post: EventRequest) {
-        queue.async {
-            self.outputBuffer.append(post)
-        }
-    }
-    
-    /**
-     * Thread-safe synchronous removal of first scheduled event
-     * - Returns: a previously scheduled event
-     */
-    func outputBufferPopFirst() -> EventRequest? {
-        queue.sync {
-            if self.outputBuffer.isEmpty {
-                return nil
-            }
-            return self.outputBuffer.remove(at: 0)
-        }
-    }
 }
 
 //MARK: NetworkIntegration
@@ -852,6 +722,7 @@ private extension EPC {
      */
     private func httpPost(url: URL, body: Data? = nil, completion: @escaping ((Result<Void, PostEventError>) -> Void)) {
         DDLogDebug("EPC: Attempting to POST data to \(url.absoluteString)")
+        
         let request = session.request(with: url, method: .post, bodyData: body, bodyEncoding: .json)
         let task = session.dataTask(with: request, completionHandler: { (_, response, error) in
             let fail: (PostEventError) ->  Void = { error in
@@ -892,6 +763,10 @@ private extension EPC {
 
 extension EPC: PeriodicWorker {
     public func doPeriodicWork(_ completion: @escaping () -> Void) {
+        if streamConfigurations == nil {
+            DDLogWarn("Event stream configurations not yet loaded; skipping event submission.")
+            return
+        }
         self.postAllScheduled(completion)
     }
 }
@@ -904,18 +779,4 @@ extension EPC: BackgroundFetcher {
             completion(.noData)
         }
     }
-}
-
-// MARK: EventInterface
-
-/**
- * Protocol for event data.
- * Currently only requires conformance to Codable.
- */
-public protocol EventInterface: Codable {
-    /**
-     * Defines which schema this event conforms to.
-     * Check the documentation for `EPC.Schema` for more information.
-     */
-    static var schema: EPC.Schema { get }
 }
